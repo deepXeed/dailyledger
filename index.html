@@ -13,8 +13,38 @@
 <meta name="apple-mobile-web-app-title" content="Ledger" />
 <link rel="stylesheet" href="style.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
 </head>
-<body>
+<body class="auth-checking">
+
+<div class="auth-loading">Loading…</div>
+
+<!-- ===== LOGIN SCREEN ===== -->
+<div id="loginScreen" class="login-screen">
+  <div class="login-card">
+    <div class="login-brand">Daily Ledger</div>
+    <p class="login-tagline">Sign in to sync your ledger across every device.</p>
+
+    <div class="field-group">
+      <label for="loginUsername">Username</label>
+      <input type="text" id="loginUsername" autocomplete="username" placeholder="e.g. ahmed" />
+    </div>
+    <div class="field-group">
+      <label for="loginSecretCode">Secret Code</label>
+      <input type="password" id="loginSecretCode" autocomplete="current-password" placeholder="At least 6 characters" />
+    </div>
+
+    <div id="loginError" class="login-error"></div>
+
+    <button class="btn btn-primary" id="loginBtn">Log In</button>
+    <button class="btn btn-outline" id="signupBtn">Create New Account</button>
+    <p class="login-hint">New here? Pick any username + secret code and tap "Create New Account" — that becomes your login everywhere.</p>
+  </div>
+</div>
+
 <div id="app">
 
   <header class="topbar">
@@ -109,6 +139,14 @@
       <div class="section-title">Settings &amp; Export</div>
 
       <div class="card" style="padding:16px;">
+        <div class="field-group" style="margin-bottom:10px;">
+          <label>Account</label>
+          <div class="field-hint">Logged in as <strong id="loggedInUsername">—</strong>. Log in with the same username + secret code on any device to see this same ledger.</div>
+        </div>
+        <button class="btn btn-outline" id="logoutBtn">Log Out</button>
+      </div>
+
+      <div class="card" style="padding:16px;">
         <div class="field-group">
           <label for="startDateInput">Ledger Start Date</label>
           <input type="date" id="startDateInput" />
@@ -141,7 +179,7 @@
       <div class="card" style="padding:16px;">
         <div class="field-group" style="margin-bottom:10px;">
           <label>Data</label>
-          <div class="field-hint">All data is stored only on this device (offline). Clearing data cannot be undone — export first if you want a backup.</div>
+          <div class="field-hint">Your ledger is stored in your private cloud account and syncs automatically across every device you log into. Clearing data cannot be undone — export first if you want a backup.</div>
         </div>
         <button class="btn btn-danger" id="clearDataBtn">Clear All Data</button>
       </div>

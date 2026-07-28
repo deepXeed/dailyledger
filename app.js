@@ -1,64 +1,74 @@
 /* ============================================================
    Daily Ledger — app.js
-   IndexedDB-backed offline ledger with Excel export (SheetJS)
+   Firebase-backed ledger (Realtime Database + Auth) with Excel export (SheetJS)
    ============================================================ */
 
-const DB_NAME = "daily_ledger_db";
-const DB_VERSION = 2;
-let dbPromise = null;
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const rtdb = firebase.database();
 
-function openDB() {
-  if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains("collections")) {
-        const s = db.createObjectStore("collections", { keyPath: "id", autoIncrement: true });
-        s.createIndex("date", "date", { unique: false });
-      }
-      if (!db.objectStoreNames.contains("expenses")) {
-        const s = db.createObjectStore("expenses", { keyPath: "id", autoIncrement: true });
-        s.createIndex("date", "date", { unique: false });
-      }
-      if (!db.objectStoreNames.contains("topups")) {
-        db.createObjectStore("topups", { keyPath: "date" });
-      }
-      if (!db.objectStoreNames.contains("settings")) {
-        db.createObjectStore("settings", { keyPath: "key" });
-      }
-      if (!db.objectStoreNames.contains("dayOptions")) {
-        db.createObjectStore("dayOptions", { keyPath: "date" });
-      }
-    };
-    req.onsuccess = (e) => resolve(e.target.result);
-    req.onerror = (e) => reject(e.target.error);
-  });
-  return dbPromise;
+let currentUser = null; // set by onAuthStateChanged
+let pendingSignupUsername = null; // avoids a display-name race right after signup
+
+/* ---------------- Auth helpers ---------------- */
+// Firebase Auth wants a real email; we turn "Username" into a fake one so the
+// UI can stay simple (just Username + Secret Code) while still getting real
+// per-account security from Firebase.
+function usernameToEmail(username) {
+  const clean = String(username || "").trim().toLowerCase().replace(/[^a-z0-9._-]/g, "");
+  return clean ? `${clean}@daily-ledger.local` : null;
 }
 
-function txStore(db, storeName, mode) {
-  return db.transaction(storeName, mode).objectStore(storeName);
+function friendlyAuthError(err) {
+  const code = err && err.code;
+  switch (code) {
+    case "auth/invalid-email":
+    case "auth/missing-email":
+      return "Please enter a username.";
+    case "auth/user-not-found":
+      return "No account with that username. Tap \"Create New Account\" if you're new.";
+    case "auth/wrong-password":
+    case "auth/invalid-credential":
+    case "auth/invalid-login-credentials":
+      return "Wrong secret code for that username.";
+    case "auth/email-already-in-use":
+      return "That username is already taken — try logging in instead.";
+    case "auth/weak-password":
+      return "Secret code must be at least 6 characters.";
+    default:
+      return (err && err.message) || "Something went wrong. Please try again.";
+  }
 }
-function reqToPromise(req) {
-  return new Promise((resolve, reject) => {
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
+
+async function logIn(username, secretCode) {
+  const email = usernameToEmail(username);
+  if (!email) throw { code: "auth/missing-email" };
+  await auth.signInWithEmailAndPassword(email, secretCode);
+}
+async function signUp(username, secretCode) {
+  const email = usernameToEmail(username);
+  if (!email) throw { code: "auth/missing-email" };
+  pendingSignupUsername = username.trim();
+  await auth.createUserWithEmailAndPassword(email, secretCode);
+  // Store the human-readable username alongside the account for display purposes.
+  await rtdb.ref(`users/${auth.currentUser.uid}/profile`).set({ username: username.trim() });
+}
+async function logOut() {
+  await auth.signOut();
+}
+
+function userRef(path) {
+  if (!currentUser) throw new Error("Not logged in");
+  return rtdb.ref(`users/${currentUser.uid}/${path}`);
 }
 
 /* ---------------- Settings ---------------- */
 async function getSettings() {
-  const db = await openDB();
-  const store = txStore(db, "settings", "readonly");
-  const [startDateRec, openingBalRec, currencyRec] = await Promise.all([
-    reqToPromise(store.get("startDate")),
-    reqToPromise(store.get("openingBalance")),
-    reqToPromise(store.get("currencyCode")),
-  ]);
-  let startDate = startDateRec ? startDateRec.value : null;
-  let openingBalance = openingBalRec ? openingBalRec.value : 0;
-  let currencyCode = currencyRec ? currencyRec.value : "AED";
+  const snap = await userRef("settings").once("value");
+  const val = snap.val() || {};
+  let startDate = val.startDate || null;
+  const openingBalance = val.openingBalance || 0;
+  const currencyCode = val.currencyCode || "AED";
   if (!startDate) {
     startDate = isoDate(new Date());
     await saveSettings({ startDate, openingBalance, currencyCode });
@@ -66,13 +76,10 @@ async function getSettings() {
   return { startDate, openingBalance, currencyCode };
 }
 async function saveSettings({ startDate, openingBalance, currencyCode }) {
-  const db = await openDB();
-  const store = txStore(db, "settings", "readwrite");
-  store.put({ key: "startDate", value: startDate });
-  store.put({ key: "openingBalance", value: Number(openingBalance) || 0 });
-  store.put({ key: "currencyCode", value: currencyCode || "AED" });
-  return new Promise((resolve) => {
-    store.transaction.oncomplete = () => resolve();
+  await userRef("settings").set({
+    startDate,
+    openingBalance: Number(openingBalance) || 0,
+    currencyCode: currencyCode || "AED",
   });
 }
 
@@ -81,99 +88,74 @@ let CURRENT_CURRENCY = "AED";
 
 /* ---------------- Collections CRUD ---------------- */
 async function addCollection(date, name, amount) {
-  const db = await openDB();
-  const store = txStore(db, "collections", "readwrite");
-  store.add({ date, name, amount: Number(amount) });
-  return new Promise((resolve) => (store.transaction.oncomplete = resolve));
+  await userRef("collections").push({ date, name, amount: Number(amount) });
 }
 async function deleteCollection(id) {
-  const db = await openDB();
-  const store = txStore(db, "collections", "readwrite");
-  store.delete(id);
-  return new Promise((resolve) => (store.transaction.oncomplete = resolve));
+  await userRef(`collections/${id}`).remove();
+}
+function snapToArray(snapVal) {
+  if (!snapVal) return [];
+  return Object.keys(snapVal).map((id) => ({ id, ...snapVal[id] }));
 }
 async function getCollectionsForDate(date) {
-  const db = await openDB();
-  const store = txStore(db, "collections", "readonly");
-  const idx = store.index("date");
-  return reqToPromise(idx.getAll(date));
+  const snap = await userRef("collections").orderByChild("date").equalTo(date).once("value");
+  return snapToArray(snap.val());
 }
 async function getAllCollections() {
-  const db = await openDB();
-  const store = txStore(db, "collections", "readonly");
-  return reqToPromise(store.getAll());
+  const snap = await userRef("collections").once("value");
+  return snapToArray(snap.val());
 }
 
 /* ---------------- Petty Fund expense log CRUD ---------------- */
 async function addExpense(date, place, amount) {
-  const db = await openDB();
-  const store = txStore(db, "expenses", "readwrite");
-  store.add({ date, place, amount: Number(amount) });
-  return new Promise((resolve) => (store.transaction.oncomplete = resolve));
+  await userRef("expenses").push({ date, place, amount: Number(amount) });
 }
 async function deleteExpense(id) {
-  const db = await openDB();
-  const store = txStore(db, "expenses", "readwrite");
-  store.delete(id);
-  return new Promise((resolve) => (store.transaction.oncomplete = resolve));
+  await userRef(`expenses/${id}`).remove();
 }
 async function getExpensesForDate(date) {
-  const db = await openDB();
-  const store = txStore(db, "expenses", "readonly");
-  const idx = store.index("date");
-  return reqToPromise(idx.getAll(date));
+  const snap = await userRef("expenses").orderByChild("date").equalTo(date).once("value");
+  return snapToArray(snap.val());
 }
 async function getAllExpenses() {
-  const db = await openDB();
-  const store = txStore(db, "expenses", "readonly");
-  return reqToPromise(store.getAll());
+  const snap = await userRef("expenses").once("value");
+  return snapToArray(snap.val());
 }
 
 /* ---------------- Top-ups (one value per date) ---------------- */
 async function setTopup(date, amount) {
-  const db = await openDB();
-  const store = txStore(db, "topups", "readwrite");
   const amt = Number(amount) || 0;
   if (amt === 0) {
-    store.delete(date);
+    await userRef(`topups/${date}`).remove();
   } else {
-    store.put({ date, amount: amt });
+    await userRef(`topups/${date}`).set(amt);
   }
-  return new Promise((resolve) => (store.transaction.oncomplete = resolve));
 }
 async function getTopup(date) {
-  const db = await openDB();
-  const store = txStore(db, "topups", "readonly");
-  const rec = await reqToPromise(store.get(date));
-  return rec ? rec.amount : 0;
+  const snap = await userRef(`topups/${date}`).once("value");
+  return snap.val() || 0;
 }
 async function getAllTopups() {
-  const db = await openDB();
-  const store = txStore(db, "topups", "readonly");
-  return reqToPromise(store.getAll());
+  const snap = await userRef("topups").once("value");
+  const val = snap.val() || {};
+  return Object.keys(val).map((date) => ({ date, amount: val[date] }));
 }
 
 /* ---------------- Day options: sweep-to-net + deposit tracking ---------------- */
 const DEFAULT_DAY_OPTIONS = { addClosingToNet: false, deposited: false, depositFull: true, depositCustomAmount: 0 };
 
 async function getDayOptions(date) {
-  const db = await openDB();
-  const store = txStore(db, "dayOptions", "readonly");
-  const rec = await reqToPromise(store.get(date));
+  const snap = await userRef(`dayOptions/${date}`).once("value");
+  const rec = snap.val();
   return rec ? { ...DEFAULT_DAY_OPTIONS, ...rec } : { ...DEFAULT_DAY_OPTIONS, date };
 }
 async function setDayOptions(date, patch) {
-  const db = await openDB();
-  const store = txStore(db, "dayOptions", "readwrite");
-  const existing = (await reqToPromise(store.get(date))) || { ...DEFAULT_DAY_OPTIONS, date };
-  const updated = { ...existing, ...patch, date };
-  store.put(updated);
-  return new Promise((resolve) => (store.transaction.oncomplete = resolve));
+  await userRef(`dayOptions/${date}`).update({ ...patch });
 }
 async function getAllDayOptions() {
-  const db = await openDB();
-  const store = txStore(db, "dayOptions", "readonly");
-  return reqToPromise(store.getAll());
+  const snap = await userRef("dayOptions").once("value");
+  const val = snap.val() || {};
+  return Object.keys(val).map((date) => ({ date, ...val[date] }));
 }
 
 /* ---------------- Date helpers ---------------- */
@@ -302,7 +284,7 @@ async function renderToday() {
   if (colls.length === 0) {
     collRows.innerHTML = `<div class="empty-hint">No collections logged for this day yet.</div>`;
   } else {
-    colls.sort((a, b) => a.id - b.id).forEach((c) => {
+    colls.sort((a, b) => (a.id < b.id ? -1 : 1)).forEach((c) => {
       const row = document.createElement("div");
       row.className = "row-item";
       row.innerHTML = `<span class="name">${escapeHtml(c.name)}</span><span class="amt">${fmtMoney(c.amount)}</span><button class="del" data-store="collections" data-id="${c.id}" aria-label="Delete">✕</button>`;
@@ -317,7 +299,7 @@ async function renderToday() {
   if (exps.length === 0) {
     expRows.innerHTML = `<div class="empty-hint">No petty fund expenses logged for this day yet.</div>`;
   } else {
-    exps.sort((a, b) => a.id - b.id).forEach((e) => {
+    exps.sort((a, b) => (a.id < b.id ? -1 : 1)).forEach((e) => {
       const row = document.createElement("div");
       row.className = "row-item";
       row.innerHTML = `<span class="name">${escapeHtml(e.place)}</span><span class="amt">${fmtMoney(e.amount)}</span><button class="del" data-store="expenses" data-id="${e.id}" aria-label="Delete">✕</button>`;
@@ -733,7 +715,7 @@ function wireEvents() {
   document.addEventListener("click", async (e) => {
     const btn = e.target.closest(".del");
     if (!btn) return;
-    const id = Number(btn.dataset.id);
+    const id = btn.dataset.id;
     if (btn.dataset.store === "collections") await deleteCollection(id);
     else await deleteExpense(id);
     await renderToday();
@@ -768,30 +750,101 @@ function wireEvents() {
   });
 
   document.getElementById("clearDataBtn").addEventListener("click", async () => {
-    if (!confirm("This will permanently delete ALL ledger data on this device. Export a backup first if needed. Continue?")) return;
-    const db = await openDB();
+    if (!confirm("This will permanently delete ALL ledger data in your account (all devices). Export a backup first if needed. Continue?")) return;
     await Promise.all(
-      ["collections", "expenses", "topups", "settings", "dayOptions"].map(
-        (name) => new Promise((resolve) => {
-          const store = txStore(db, name, "readwrite");
-          store.clear();
-          store.transaction.oncomplete = resolve;
-        })
-      )
+      ["collections", "expenses", "topups", "settings", "dayOptions"].map((name) => userRef(name).remove())
     );
-    dbPromise = null;
     showToast("All data cleared");
     await switchView("today");
   });
 }
 
-/* ---------------- Init ---------------- */
-window.addEventListener("DOMContentLoaded", async () => {
-  wireEvents();
+/* ---------------- Auth UI wiring ---------------- */
+function setLoginError(msg) {
+  document.getElementById("loginError").textContent = msg || "";
+}
+
+function wireAuthEvents() {
+  document.getElementById("loginBtn").addEventListener("click", async () => {
+    const username = document.getElementById("loginUsername").value;
+    const secretCode = document.getElementById("loginSecretCode").value;
+    setLoginError("");
+    if (!username.trim() || !secretCode) { setLoginError("Enter a username and secret code."); return; }
+    try {
+      await logIn(username, secretCode);
+    } catch (err) {
+      setLoginError(friendlyAuthError(err));
+    }
+  });
+
+  document.getElementById("signupBtn").addEventListener("click", async () => {
+    const username = document.getElementById("loginUsername").value;
+    const secretCode = document.getElementById("loginSecretCode").value;
+    setLoginError("");
+    if (!username.trim() || !secretCode) { setLoginError("Enter a username and secret code."); return; }
+    if (secretCode.length < 6) { setLoginError("Secret code must be at least 6 characters."); return; }
+    try {
+      await signUp(username, secretCode);
+    } catch (err) {
+      setLoginError(friendlyAuthError(err));
+    }
+  });
+
+  document.getElementById("logoutBtn").addEventListener("click", async () => {
+    if (!confirm("Log out of this device?")) return;
+    await logOut();
+  });
+}
+
+async function onLoggedIn(user) {
+  currentUser = user;
+  document.body.classList.remove("auth-checking");
+  document.body.classList.add("logged-in");
+  document.getElementById("loginError").textContent = "";
+  document.getElementById("loginUsername").value = "";
+  document.getElementById("loginSecretCode").value = "";
+
+  // Show a friendly username: prefer a just-completed signup, then the saved
+  // profile name, then fall back to the local part of the internal email.
+  let displayName = (user.email || "").split("@")[0];
+  if (pendingSignupUsername) {
+    displayName = pendingSignupUsername;
+    pendingSignupUsername = null;
+  } else {
+    try {
+      const snap = await rtdb.ref(`users/${user.uid}/profile/username`).once("value");
+      if (snap.val()) displayName = snap.val();
+    } catch (e) { /* ignore — fallback name above is fine */ }
+  }
+  document.getElementById("loggedInUsername").textContent = displayName;
+
   const settings = await getSettings();
   CURRENT_CURRENCY = settings.currencyCode;
   populateCurrencySelectors(settings.currencyCode);
   await switchView("today");
+}
+
+function onLoggedOut() {
+  currentUser = null;
+  document.body.classList.remove("auth-checking");
+  document.body.classList.remove("logged-in");
+}
+
+/* ---------------- Init ---------------- */
+window.addEventListener("DOMContentLoaded", () => {
+  wireEvents();
+  wireAuthEvents();
+
+  auth.onAuthStateChanged(async (user) => {
+    try {
+      if (user) await onLoggedIn(user);
+      else onLoggedOut();
+    } catch (err) {
+      console.error(err);
+      document.body.classList.remove("auth-checking");
+    }
+  });
+
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch(() => {});
   }

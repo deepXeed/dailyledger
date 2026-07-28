@@ -1,9 +1,10 @@
-const CACHE_NAME = "daily-ledger-cache-v2";
+const CACHE_NAME = "daily-ledger-cache-v3";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./style.css",
   "./app.js",
+  "./firebase-config.js",
   "./manifest.json",
   "./icons/icon-192.png",
   "./icons/icon-512.png"
@@ -27,8 +28,12 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const req = event.request;
-  // Network-first for the SheetJS CDN script so exports stay up to date when online.
-  if (req.url.includes("cdnjs.cloudflare.com")) {
+  // Network-first for the SheetJS + Firebase SDK CDN scripts so the app always
+  // gets the latest library build when online, falling back to cache offline.
+  // (Note: actual database reads/writes go over Firebase's own WebSocket
+  // connection, not plain fetches, so this only covers loading the SDK itself —
+  // you still need connectivity to sign in and sync data.)
+  if (req.url.includes("cdnjs.cloudflare.com") || req.url.includes("gstatic.com")) {
     event.respondWith(
       fetch(req)
         .then((res) => {
