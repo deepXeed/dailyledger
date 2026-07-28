@@ -44,7 +44,6 @@ body {
   display: flex;
   flex-direction: column;
   padding-bottom: env(safe-area-inset-bottom);
-  overscroll-behavior: none;
 }
 
 button, input, select {
