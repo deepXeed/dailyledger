@@ -183,26 +183,20 @@ function fmtDisplayDate(s) {
 
 /* ---------------- Ledger chain computation ---------------- */
 // Computes the running Petty Fund chain from settings.startDate through endDateStr (inclusive).
-// Each row also folds in that day's sweep-to-net and deposit choices, and the leftover
-// (petty balance not swept + collection not deposited) becomes next day's carried-forward
-// Petty Fund balance. Returns a Map<dateStr, rowObject>.
-async function computeChain(endDateStr) {
-  const settings = await getSettings();
+// Uses cached raw data when available so deposit toggles stay snappy.
+function computeChainFromData(endDateStr, data) {
+  const settings = data.settings;
   const map = new Map();
-  if (endDateStr < settings.startDate) return map;
-
-  const [allColl, allExp, allTopups, allOpts] = await Promise.all([
-    getAllCollections(), getAllExpenses(), getAllTopups(), getAllDayOptions(),
-  ]);
+  if (!settings || endDateStr < settings.startDate) return map;
 
   const collByDate = {};
-  for (const c of allColl) collByDate[c.date] = (collByDate[c.date] || 0) + c.amount;
+  for (const c of data.collections) collByDate[c.date] = (collByDate[c.date] || 0) + c.amount;
   const expByDate = {};
-  for (const e of allExp) expByDate[e.date] = (expByDate[e.date] || 0) + e.amount;
+  for (const e of data.expenses) expByDate[e.date] = (expByDate[e.date] || 0) + e.amount;
   const topupByDate = {};
-  for (const t of allTopups) topupByDate[t.date] = t.amount;
+  for (const t of data.topups) topupByDate[t.date] = t.amount;
   const optsByDate = {};
-  for (const o of allOpts) optsByDate[o.date] = o;
+  for (const o of data.dayOptions) optsByDate[o.date] = o;
 
   let balance = Number(settings.openingBalance) || 0;
   let d = settings.startDate;
@@ -240,6 +234,7 @@ async function computeChain(endDateStr) {
       date: d, carry, topup, open, exp, shortfall, pettyClosing, coll, netCollection,
       addClosingToNet, netAmount,
       deposited: !!opts.deposited, depositFull: !!opts.depositFull,
+      depositCustomAmount: Number(opts.depositCustomAmount) || 0,
       depositedAmount, remaining, pettyRetained, nextCarry,
     });
     balance = nextCarry;
@@ -248,11 +243,55 @@ async function computeChain(endDateStr) {
   return map;
 }
 
+async function computeChain(endDateStr) {
+  const data = await loadLedgerData();
+  return computeChainFromData(endDateStr, data);
+}
+
 /* ---------------- App state ---------------- */
 const state = {
   currentDate: isoDate(new Date()),
   activeView: "today",
 };
+
+/* Raw-data cache so deposit toggles don't re-fetch the whole ledger */
+const dataCache = {
+  collections: null,
+  expenses: null,
+  topups: null,
+  dayOptions: null,
+  settings: null,
+  dirty: true,
+};
+
+function invalidateCache() {
+  dataCache.dirty = true;
+  dataCache.collections = null;
+  dataCache.expenses = null;
+  dataCache.topups = null;
+  dataCache.dayOptions = null;
+  dataCache.settings = null;
+}
+
+async function loadLedgerData(force = false) {
+  if (!force && !dataCache.dirty && dataCache.collections) {
+    return dataCache;
+  }
+  const [collections, expenses, topups, dayOptions, settings] = await Promise.all([
+    getAllCollections(),
+    getAllExpenses(),
+    getAllTopups(),
+    getAllDayOptions(),
+    getSettings(),
+  ]);
+  dataCache.collections = collections;
+  dataCache.expenses = expenses;
+  dataCache.topups = topups;
+  dataCache.dayOptions = dayOptions;
+  dataCache.settings = settings;
+  dataCache.dirty = false;
+  return dataCache;
+}
 
 /* ---------------- Toast ---------------- */
 let toastTimer = null;
@@ -315,9 +354,17 @@ async function renderToday() {
     return;
   }
   depositCard.style.display = "";
-  const chain = await computeChain(state.currentDate);
+  // Warm the full-ledger cache, then paint from it (avoids a second full fetch on toggle)
+  await loadLedgerData();
+  const chain = computeChainFromData(state.currentDate, dataCache);
   const row = chain.get(state.currentDate);
+  if (!row) return;
+  paintDaySummaryTape(row);
+  renderDepositCard(row);
+}
 
+function paintDaySummaryTape(row) {
+  const tape = document.getElementById("daySummaryTape");
   tape.innerHTML = `
     <div class="tape-row"><span class="label">Carried Forward from Previous Day</span><span class="val">${fmtMoney(row.carry)}</span></div>
     <div class="tape-row"><span class="label">Additional Funds Added</span><span class="val">${fmtMoney(row.topup)}</span></div>
@@ -328,71 +375,136 @@ async function renderToday() {
     <div class="tape-row"><span class="label">Total Customer Collection</span><span class="val">${fmtMoney(row.coll)}</span></div>
     <div class="tape-row total"><span class="label">Net Collection After Petty Deduction</span><span class="val ${row.shortfall > 0 ? "warn" : "good"}">${fmtMoney(row.netCollection)}</span></div>
   `;
-
-  renderDepositCard(row);
 }
 
 function renderDepositCard(row) {
   const body = document.getElementById("depositCardBody");
+  // Amounts first, Yes/No questions at the end (deposited / not deposited sit just above them)
   let html = `
-    <div class="toggle-group">
-      <label>Add Petty Fund Closing Balance (${fmtMoney(row.pettyClosing)}) to Net Collection?</label>
-      <div class="toggle-btns">
-        <button type="button" class="toggle-btn ${row.addClosingToNet ? "active" : ""}" data-toggle="addClosingToNet" data-value="true">Yes</button>
-        <button type="button" class="toggle-btn ${!row.addClosingToNet ? "active" : ""}" data-toggle="addClosingToNet" data-value="false">No</button>
-      </div>
+    <div class="deposit-amounts">
+      <div class="tape-row total"><span class="label">Net Amount (available for deposit)</span><span class="val">${fmtMoney(row.netAmount)}</span></div>
+      <div class="tape-row total highlight"><span class="label">Deposited Amount</span><span class="val good">${fmtMoney(row.depositedAmount)}</span></div>
+      <div class="tape-row total"><span class="label">Not Deposited — Carried to Petty Fund</span><span class="val ${row.remaining > 0 ? "warn" : ""}">${fmtMoney(row.remaining)}</span></div>
     </div>
-    <div class="tape-row total"><span class="label">Net Amount (available for deposit)</span><span class="val">${fmtMoney(row.netAmount)}</span></div>
-
-    <div class="toggle-group">
-      <label>Is today's Net Amount deposited?</label>
-      <div class="toggle-btns">
-        <button type="button" class="toggle-btn ${row.deposited ? "active" : ""}" data-toggle="deposited" data-value="true">Yes</button>
-        <button type="button" class="toggle-btn ${!row.deposited ? "active" : ""}" data-toggle="deposited" data-value="false">No</button>
+    <div class="deposit-questions">
+      <div class="toggle-group">
+        <label>Add Petty Fund Closing Balance (${fmtMoney(row.pettyClosing)}) to Net Collection?</label>
+        <div class="toggle-btns">
+          <button type="button" class="toggle-btn ${row.addClosingToNet ? "active" : ""}" data-toggle="addClosingToNet" data-value="true">Yes</button>
+          <button type="button" class="toggle-btn ${!row.addClosingToNet ? "active" : ""}" data-toggle="addClosingToNet" data-value="false">No</button>
+        </div>
       </div>
-    </div>
+      <div class="toggle-group">
+        <label>Is today's Net Amount deposited?</label>
+        <div class="toggle-btns">
+          <button type="button" class="toggle-btn ${row.deposited ? "active" : ""}" data-toggle="deposited" data-value="true">Yes</button>
+          <button type="button" class="toggle-btn ${!row.deposited ? "active" : ""}" data-toggle="deposited" data-value="false">No</button>
+        </div>
+      </div>
   `;
 
   if (row.deposited) {
     html += `
-    <div class="toggle-group">
-      <label>Deposit the full amount?</label>
-      <div class="toggle-btns">
-        <button type="button" class="toggle-btn ${row.depositFull ? "active" : ""}" data-toggle="depositFull" data-value="true">Yes, full</button>
-        <button type="button" class="toggle-btn ${!row.depositFull ? "active" : ""}" data-toggle="depositFull" data-value="false">No, custom</button>
-      </div>
-    </div>`;
+      <div class="toggle-group">
+        <label>Deposit the full amount?</label>
+        <div class="toggle-btns">
+          <button type="button" class="toggle-btn ${row.depositFull ? "active" : ""}" data-toggle="depositFull" data-value="true">Yes, full</button>
+          <button type="button" class="toggle-btn ${!row.depositFull ? "active" : ""}" data-toggle="depositFull" data-value="false">No, custom</button>
+        </div>
+      </div>`;
     if (!row.depositFull) {
       html += `
-      <div class="topup-input-row">
+      <div class="topup-input-row deposit-custom">
         <label for="customDepositInput">Custom deposit amount</label>
-        <input type="number" id="customDepositInput" step="0.01" min="0" max="${row.netAmount}" value="${row.depositedAmount || ""}" placeholder="0.00" />
+        <input type="number" id="customDepositInput" step="0.01" min="0" max="${row.netAmount}" value="${row.depositCustomAmount || row.depositedAmount || ""}" placeholder="0.00" />
       </div>`;
     }
   }
 
-  html += `
-    <div class="tape-row total"><span class="label">Deposited Amount</span><span class="val good">${fmtMoney(row.depositedAmount)}</span></div>
-    <div class="tape-row total"><span class="label">Not Deposited — Carried to Petty Fund</span><span class="val ${row.remaining > 0 ? "warn" : ""}">${fmtMoney(row.remaining)}</span></div>
-  `;
-
+  html += `</div>`;
   body.innerHTML = html;
+  wireDepositCardEvents();
+}
 
+function wireDepositCardEvents() {
+  const body = document.getElementById("depositCardBody");
   body.querySelectorAll(".toggle-btn").forEach((btn) => {
     btn.addEventListener("click", async () => {
+      if (btn.disabled) return;
       const field = btn.dataset.toggle;
       const value = btn.dataset.value === "true";
-      await setDayOptions(state.currentDate, { [field]: value });
-      await renderToday();
+
+      // Optimistic active state for instant feedback
+      const group = btn.closest(".toggle-btns");
+      if (group) {
+        group.querySelectorAll(".toggle-btn").forEach((b) => b.classList.toggle("active", b === btn));
+      }
+      body.querySelectorAll(".toggle-btn").forEach((b) => { b.disabled = true; });
+
+      try {
+        await setDayOptions(state.currentDate, { [field]: value });
+        // Patch local cache so we don't re-fetch everything
+        patchDayOptionsCache(state.currentDate, { [field]: value });
+        await refreshSummaryAndDeposit();
+      } catch (err) {
+        console.error(err);
+        showToast("Could not save — check connection");
+        await refreshSummaryAndDeposit();
+      }
     });
   });
+
   const customInput = document.getElementById("customDepositInput");
   if (customInput) {
-    customInput.addEventListener("change", async (e) => {
-      await setDayOptions(state.currentDate, { depositCustomAmount: Number(e.target.value) || 0 });
-      await renderToday();
+    let debounceTimer = null;
+    const saveCustom = async () => {
+      const amount = Number(customInput.value) || 0;
+      try {
+        await setDayOptions(state.currentDate, { depositCustomAmount: amount });
+        patchDayOptionsCache(state.currentDate, { depositCustomAmount: amount });
+        await refreshSummaryAndDeposit();
+      } catch (err) {
+        console.error(err);
+        showToast("Could not save — check connection");
+      }
+    };
+    customInput.addEventListener("change", saveCustom);
+    customInput.addEventListener("input", () => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(saveCustom, 350);
     });
   }
+}
+
+function patchDayOptionsCache(date, patch) {
+  if (!dataCache.dayOptions) return;
+  const idx = dataCache.dayOptions.findIndex((o) => o.date === date);
+  if (idx >= 0) {
+    dataCache.dayOptions[idx] = { ...dataCache.dayOptions[idx], ...patch };
+  } else {
+    dataCache.dayOptions.push({ date, ...DEFAULT_DAY_OPTIONS, ...patch });
+  }
+}
+
+/** Fast path: recompute chain from cache and repaint summary + deposit only */
+async function refreshSummaryAndDeposit() {
+  const settings = dataCache.settings || (await getSettings());
+  const depositCard = document.getElementById("depositCard");
+  const tape = document.getElementById("daySummaryTape");
+
+  if (state.currentDate < settings.startDate) {
+    tape.innerHTML = `<div class="empty-hint">This date is before your Ledger Start Date (set in Settings), so it isn't included in the Petty Fund chain yet.</div>`;
+    depositCard.style.display = "none";
+    return;
+  }
+  depositCard.style.display = "";
+
+  const data = await loadLedgerData();
+  const chain = computeChainFromData(state.currentDate, data);
+  const row = chain.get(state.currentDate);
+  if (!row) return;
+  paintDaySummaryTape(row);
+  renderDepositCard(row);
 }
 
 function escapeHtml(s) {
@@ -546,6 +658,7 @@ async function applyCurrencyChange(newCode) {
   populateCurrencySelectors(newCode);
   const settings = await getSettings();
   await saveSettings({ ...settings, currencyCode: newCode });
+  invalidateCache();
   await switchView(state.activeView);
   showToast("Currency set to " + newCode);
 }
@@ -690,6 +803,7 @@ function wireEvents() {
     const amount = document.getElementById("collectionAmount").value;
     if (!name || !amount) return;
     await addCollection(state.currentDate, name, amount);
+    invalidateCache();
     e.target.reset();
     await renderToday();
     showToast("Collection added");
@@ -701,6 +815,7 @@ function wireEvents() {
     const amount = document.getElementById("expenseAmount").value;
     if (!place || !amount) return;
     await addExpense(state.currentDate, place, amount);
+    invalidateCache();
     e.target.reset();
     await renderToday();
     showToast("Petty fund expense logged");
@@ -708,6 +823,7 @@ function wireEvents() {
 
   document.getElementById("topupInput").addEventListener("change", async (e) => {
     await setTopup(state.currentDate, e.target.value);
+    invalidateCache();
     await renderToday();
     showToast("Top-up saved");
   });
@@ -718,6 +834,7 @@ function wireEvents() {
     const id = btn.dataset.id;
     if (btn.dataset.store === "collections") await deleteCollection(id);
     else await deleteExpense(id);
+    invalidateCache();
     await renderToday();
   });
 
@@ -731,6 +848,7 @@ function wireEvents() {
     if (!startDate) { showToast("Please pick a start date"); return; }
     const settings = await getSettings();
     await saveSettings({ startDate, openingBalance, currencyCode: settings.currencyCode });
+    invalidateCache();
     showToast("Settings saved");
   });
 
@@ -754,6 +872,7 @@ function wireEvents() {
     await Promise.all(
       ["collections", "expenses", "topups", "settings", "dayOptions"].map((name) => userRef(name).remove())
     );
+    invalidateCache();
     showToast("All data cleared");
     await switchView("today");
   });
@@ -798,6 +917,7 @@ function wireAuthEvents() {
 
 async function onLoggedIn(user) {
   currentUser = user;
+  invalidateCache();
   document.body.classList.remove("auth-checking");
   document.body.classList.add("logged-in");
   document.getElementById("loginError").textContent = "";
