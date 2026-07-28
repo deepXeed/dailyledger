@@ -330,6 +330,7 @@ header.topbar .date-nav .today-btn {
 /* ---------- Main content ---------- */
 main {
   flex: 1;
+  min-height: 0;
   padding: 16px 16px 100px;
   overflow-y: auto;
   overflow-x: hidden;
