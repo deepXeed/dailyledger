@@ -142,7 +142,13 @@ async function getAllTopups() {
 }
 
 /* ---------------- Day options: sweep-to-net + deposit tracking ---------------- */
-const DEFAULT_DAY_OPTIONS = { addClosingToNet: false, deposited: false, depositFull: true, depositCustomAmount: 0 };
+const DEFAULT_DAY_OPTIONS = {
+  addClosingToNet: false,
+  deductTopupFromNet: false,
+  deposited: false,
+  depositFull: true,
+  depositCustomAmount: 0,
+};
 
 async function getDayOptions(date) {
   const snap = await userRef(`dayOptions/${date}`).once("value");
@@ -212,17 +218,21 @@ function computeChainFromData(endDateStr, data) {
 
     const opts = { ...DEFAULT_DAY_OPTIONS, ...(optsByDate[d] || {}) };
     const addClosingToNet = !!opts.addClosingToNet;
-    const netAmount = netCollection + (addClosingToNet ? pettyClosing : 0);
+    const deductTopupFromNet = !!opts.deductTopupFromNet;
+    // Gross net, then optionally subtract Additional Funds if they came from depositable cash
+    let netAmount = netCollection + (addClosingToNet ? pettyClosing : 0);
+    if (deductTopupFromNet) netAmount -= topup;
 
     let depositedAmount, remaining;
     if (!opts.deposited) {
       depositedAmount = 0;
       remaining = netAmount;
     } else if (opts.depositFull) {
-      depositedAmount = netAmount;
-      remaining = 0;
+      depositedAmount = Math.max(netAmount, 0);
+      remaining = netAmount - depositedAmount;
     } else {
-      const custom = Math.min(Math.max(Number(opts.depositCustomAmount) || 0, 0), netAmount);
+      const cap = Math.max(netAmount, 0);
+      const custom = Math.min(Math.max(Number(opts.depositCustomAmount) || 0, 0), cap);
       depositedAmount = custom;
       remaining = netAmount - custom;
     }
@@ -232,7 +242,7 @@ function computeChainFromData(endDateStr, data) {
 
     map.set(d, {
       date: d, carry, topup, open, exp, shortfall, pettyClosing, coll, netCollection,
-      addClosingToNet, netAmount,
+      addClosingToNet, deductTopupFromNet, netAmount,
       deposited: !!opts.deposited, depositFull: !!opts.depositFull,
       depositCustomAmount: Number(opts.depositCustomAmount) || 0,
       depositedAmount, remaining, pettyRetained, nextCarry,
@@ -392,6 +402,13 @@ function renderDepositCard(row) {
         <div class="toggle-btns">
           <button type="button" class="toggle-btn ${row.addClosingToNet ? "active" : ""}" data-toggle="addClosingToNet" data-value="true">Yes</button>
           <button type="button" class="toggle-btn ${!row.addClosingToNet ? "active" : ""}" data-toggle="addClosingToNet" data-value="false">No</button>
+        </div>
+      </div>
+      <div class="toggle-group">
+        <label>Deduct Additional Funds (${fmtMoney(row.topup)}) from Net Collection?</label>
+        <div class="toggle-btns">
+          <button type="button" class="toggle-btn ${row.deductTopupFromNet ? "active" : ""}" data-toggle="deductTopupFromNet" data-value="true">Yes</button>
+          <button type="button" class="toggle-btn ${!row.deductTopupFromNet ? "active" : ""}" data-toggle="deductTopupFromNet" data-value="false">No</button>
         </div>
       </div>
       <div class="toggle-group">
@@ -721,7 +738,7 @@ async function exportYearToExcel(year) {
   XLSX.utils.book_append_sheet(wb, yearWs, "Yearly Summary");
 
   // ---- One sheet per month ----
-  const monthHeader = ["Date", "Carried Forward", "Additional Funds Added", "Opening Balance", "Customer Collection", "Petty Fund Expense", "Shortfall from Collection", "Net Collection", "Added Petty Closing to Net?", "Net Amount", "Deposited?", "Deposited Amount", "Not Deposited (Carried Fwd)"];
+  const monthHeader = ["Date", "Carried Forward", "Additional Funds Added", "Opening Balance", "Customer Collection", "Petty Fund Expense", "Shortfall from Collection", "Net Collection", "Added Petty Closing to Net?", "Deducted Additional Funds from Net?", "Net Amount", "Deposited?", "Deposited Amount", "Not Deposited (Carried Fwd)"];
   for (let month = 1; month <= 12; month++) {
     const dim = daysInMonth(year, month);
     const aoa = [monthHeader];
@@ -729,20 +746,22 @@ async function exportYearToExcel(year) {
     for (let day = 1; day <= dim; day++) {
       const dstr = `${year}-${pad2(month)}-${pad2(day)}`;
       const row = chain.get(dstr);
-      if (!row) { aoa.push([dstr, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A"]); continue; }
+      if (!row) { aoa.push([dstr, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A"]); continue; }
       aoa.push([
         dstr, row.carry, row.topup, row.open, row.coll, row.exp, row.shortfall, row.netCollection,
-        row.addClosingToNet ? "Yes" : "No", row.netAmount,
+        row.addClosingToNet ? "Yes" : "No",
+        row.deductTopupFromNet ? "Yes" : "No",
+        row.netAmount,
         row.deposited ? (row.depositFull ? "Yes (Full)" : "Yes (Custom)") : "No",
         row.depositedAmount, row.nextCarry,
       ]);
       tColl += row.coll; tExp += row.exp; tShort += row.shortfall; tNet += row.netCollection;
       tAmount += row.netAmount; tDeposited += row.depositedAmount; tCarry = row.nextCarry;
     }
-    aoa.push(["TOTAL", "", "", "", tColl, tExp, tShort, tNet, "", tAmount, "", tDeposited, tCarry]);
+    aoa.push(["TOTAL", "", "", "", tColl, tExp, tShort, tNet, "", "", tAmount, "", tDeposited, tCarry]);
     const ws = XLSX.utils.aoa_to_sheet(aoa);
-    ws["!cols"] = [{ wch: 12 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 16 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 16 }];
-    applyCurrencyCols(ws, ["B", "C", "D", "E", "F", "G", "H", "J", "L", "M"], aoa.length - 1);
+    ws["!cols"] = [{ wch: 12 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 16 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 16 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 16 }];
+    applyCurrencyCols(ws, ["B", "C", "D", "E", "F", "G", "H", "K", "M", "N"], aoa.length - 1);
     XLSX.utils.book_append_sheet(wb, ws, MONTH_NAMES[month - 1].slice(0, 31));
   }
 

@@ -1,4 +1,4 @@
-const CACHE_NAME = "daily-ledger-cache-v6";
+const CACHE_NAME = "daily-ledger-cache-v7";
 const APP_SHELL = [
   "./",
   "./index.html",
