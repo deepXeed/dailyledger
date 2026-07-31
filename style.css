@@ -631,7 +631,8 @@ input:focus, select:focus {
 
 table.ledger-table {
   width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: 12.5px;
 }
 
@@ -643,7 +644,8 @@ table.ledger-table th {
   font-weight: 600;
   position: sticky;
   top: 0;
-  z-index: 1;
+  z-index: 3;
+  box-shadow: 0 1px 0 var(--ink);
 }
 
 table.ledger-table th:first-child { text-align: left; }
@@ -667,6 +669,10 @@ table.ledger-table tr.total-row td {
   background: var(--parchment-dim);
   font-weight: 700;
   border-top: 2px solid var(--ink);
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  box-shadow: 0 -1px 0 var(--line);
 }
 
 table.ledger-table tr.na-row td {
@@ -674,11 +680,21 @@ table.ledger-table tr.na-row td {
   font-style: italic;
 }
 
+/*
+  Header row stays frozen at top of this box.
+  Height leaves room for topbar + selectors + bottom nav
+  so TOTAL is reachable and not hidden under the nav.
+*/
 .table-scroll {
-  overflow-x: auto;
+  overflow: auto;
+  max-height: calc(100vh - 280px);
+  max-height: calc(100dvh - 280px);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  background: #fff;
+  margin-bottom: 8px;
 }
 
 /* ---------- Settings ---------- */
