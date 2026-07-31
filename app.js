@@ -395,6 +395,7 @@ function renderDepositCard(row) {
       <div class="tape-row total"><span class="label">Net Amount (available for deposit)</span><span class="val">${fmtMoney(row.netAmount)}</span></div>
       <div class="tape-row total highlight"><span class="label">Deposited Amount</span><span class="val good">${fmtMoney(row.depositedAmount)}</span></div>
       <div class="tape-row total"><span class="label">Not Deposited — Carried to Petty Fund</span><span class="val ${row.remaining > 0 ? "warn" : ""}">${fmtMoney(row.remaining)}</span></div>
+      <div class="tape-row total highlight"><span class="label">Total Carried to Next Day</span><span class="val">${fmtMoney(row.nextCarry)}</span></div>
     </div>
     <div class="deposit-questions">
       <div class="toggle-group">
